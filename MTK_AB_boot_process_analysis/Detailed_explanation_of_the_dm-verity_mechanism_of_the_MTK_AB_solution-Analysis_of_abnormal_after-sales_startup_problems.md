@@ -1052,6 +1052,7 @@ static AvbIOResult avb_manage_hashtree_error_mode(
         data, AVB_DIGEST_TYPE_SHA256, vbmeta_digest_sha256);
     // 会写持久化数据将vbmeta_digest_sha256的值写到
     // key为 avb.managed_verity_mode 的持久化空间，写入AVB_SHA256_DIGEST_SIZE长度
+	// 也就是标记了当前slot运行在eio模式
     io_ret = ops->write_persistent_value(ops, AVB_NPV_MANAGED_VERITY_MODE,
                 AVB_SHA256_DIGEST_SIZE, vbmeta_digest_sha256);
     if (io_ret != AVB_IO_RESULT_OK) {
@@ -1120,17 +1121,135 @@ out:
 }
 ```
 
-因此经过上述流程分析我们可以得出如下结论：
+重点分析一下`get_dm_verity_status()`这个函数：
 
-* 若由于EIO模式导致的重启，则会在持久化空间的制定区域进行标记，直到检测到新的OS后将EIO的标记清除，否则，系统每次开机后均会打印`dm-verity corruption`并在用户没有按下power时进行power_off操作；
+```c
+//platform/mt6771/include/platform/mt_reg_base.h
+#define SECURITY_AO_BASE (0x1001a000)
+
+//platform/mt6771/include/platform/mt_typedefs.h
+#define READ_REGISTER_UINT32(reg) \
+    (*(volatile unsigned int * const)(reg))
+#define INREG32(x)          READ_REGISTER_UINT32((unsigned int *)(x))
+#define DRV_Reg32(addr)             INREG32(addr)
+
+//platform/mt6771/dm_verity_status.c
+#define BOOT_MISC2          (SECURITY_AO_BASE + 0x088)
+#define BOOT_MISC2_DM_VERITY_ERR (0x1 << 0)
+
+void get_dm_verity_status(uint32_t *status)
+{
+	uint32_t dm_verity_state_reg = DM_VERITY_STATUS_OK;
+	uint32_t seccfg_ret = 0;
+	uint32_t dm_verity_state_seccfg = DM_VERITY_STATUS_OK;
+
+	if (status == NULL)
+		return;
+
+	*status = DM_VERITY_STATUS_OK;
+
+#ifdef MTK_SECURITY_SW_SUPPORT
+	// 读取 BOOT_MISC2 这个32位寄存器的第二位，若该位置位表示出现了dm-verity的异常
+	if (DRV_Reg32(BOOT_MISC2) & BOOT_MISC2_DM_VERITY_ERR) {
+		dm_verity_state_reg = DM_VERITY_GENERAL_ERROR;
+		*status = DM_VERITY_GENERAL_ERROR;
+		pal_log_err("[dm-verity] error\n");
+	} else
+		pal_log_err("[dm-verity] ok\n");
+	PAL_UNUSED_PARAM(dm_verity_state_reg);
+	PAL_UNUSED_PARAM(seccfg_ret);
+	PAL_UNUSED_PARAM(dm_verity_state_seccfg);
+	pal_log_err("[dm-verity] status 0x%x\n", *status);
+......
+#endif
+	return;
+}
+```
+
+根据该函数的逻辑我们可以看到，在`load_vfy_boot()`中会去获取dm_verity的状态，如果32位寄存器 `BOOT_MISC2` 的第二位置位，则表示dm-verity出现了异常，之后会设置`AVB_SLOT_VERIFY_FLAGS_RESTART_CAUSED_BY_HASHTREE_CORRUPTION` 这个flag的值并向下传递，直到`avb_manage_hashtree_error_mode()`中根据flag去判断校验结果是否为EIO，那到底是在什么地方对寄存器进行标记的呢？我们继续往下看，由于dm-verity是Linux kernel的一项机制，并且每次触发dm-verity corruption时均有KE导致重启的问题，因此，我们分析一下对应的kernel端代码：
+
+`kernel-4.14`
+
+```c
+// drivers/watchdog/mediatek/wdk/wd_api.c
+
+// 若系统发生重启，则都会走到这个地方
+static int mtk_arch_reset_handle(struct notifier_block *this,
+	unsigned long mode, void *cmd)
+{
+	pr_info("ARCH_RESET happen!!!\n");
+	arch_reset(mode, cmd);
+	pr_info("ARCH_RESET end!!!!\n");
+	return NOTIFY_DONE;
+}
+
+// 该函数会根据cmd的原因选择重启模式，如recovery、bootloader等
+void arch_reset(char mode, const char *cmd)
+{
+......
+// 当发现系统是由于“dm-verity device corruption”发生的重启，则会调用
+// masp_hal_set_dm_verity_error()对寄存器进行错误置位
+} else if (cmd && !strcmp(cmd, "dm-verity device corrupted")) {
+#ifdef CONFIG_MTK_SECURITY_SW_SUPPORT
+        res = masp_hal_set_dm_verity_error();
+        #endif
+                reboot = WD_SW_RESET_BYPASS_PWR_KEY;
+......
+}
+
+// drivers/misc/mediatek/masp/asfv2/mach/mt6771/security_ao.c
+int masp_hal_set_dm_verity_error(void)
+{
+	int ret = 0;
+	struct device_node *np_secao = NULL;
+	unsigned int rst_con = 0;
+	unsigned int reg_val = 0;
+	const char *compatible = security_ao_ids[0].compatible;
+
+	/* get security ao base address */
+	if (!security_ao_base) {
+		np_secao = of_find_compatible_node(NULL,
+						   NULL,
+						   compatible);
+		if (!np_secao) {
+			pr_notice("[SEC AO] security ao node not found\n");
+			return -ENXIO;
+		}
+
+		security_ao_base = (void __iomem *)of_iomap(np_secao, 0);
+		if (!security_ao_base) {
+			pr_notice("[SEC AO] security ao register remapping failed\n");
+			return -ENXIO;
+		}
+	}
+
+	/* configure to make misc register live after system reset */
+	mt_reg_sync_writel(MISC_LOCK_KEY_MAGIC, (void *)MISC_LOCK_KEY);
+	rst_con = __raw_readl((const void *)RST_CON);
+	rst_con |= RST_CON_BIT(BOOT_MISC2_IDX);
+	mt_reg_sync_writel(rst_con, (void *)RST_CON);
+	mt_reg_sync_writel(0, (void *)MISC_LOCK_KEY);
+
+	// 设置dm-verity的错误标志位，也就是寄存器BOOT_MISC2的BOOT_MISC2_VERITY_ERR位
+	/* set dm-verity error flag to misc2 */
+	reg_val = __raw_readl((const void *)BOOT_MISC2);
+	reg_val |= BOOT_MISC2_VERITY_ERR;
+	mt_reg_sync_writel(reg_val, (void *)BOOT_MISC2);
+
+	return ret;
+}
+
+```
+
+经过上述分析，`dm-verity corruption`出现的整个逻辑就非常清晰明了了，一定时kernel判断到了`dm-verity device corruption`，换句话说device mapper的设备出现了问题，而device mapper设备其实对应的时具体的物理设备，仅仅只是在其中间增加了一层映射关系，保证上层对物理设备操作的安全新，所以出现device-mapper设备的异常基本可以实锤是硬件问题了，这也就印证了售后出现的`dm-verity corruption`的机器经过对应log分析后发现大多数都是DDR问题。
 
 ## 五、售后无法开机的问题分析
 
-通过整体的代码追踪下拉可以发现`AVB_SLOT_VERIFY_RESULT_ERROR_OOM`与`AVB_SLOT_VERIFY_RESULT_ERROR_IO`两种模式均是单独处理的错误，并且这两种错误不能容忍，会直接失败报错，也就是说之前出现的所有的`dm-verity curruption`问题均是在AVB阶段的IO读写出现了或多或少的问题（退一步来说也就是DDR或EMMC的读取数据出现了差错），而一旦进入EIO模式，则对应的slot则会被标记，直到升级至新的系统才能解除。
+因此经过上述流程分析我们可以得出如下结论：
 
-因此将售后出现dm-verity corruption的机器进行OTA升级后，通过power键进入系统后进行OTA启动到另一slot后EIO模式解除，但是整体来说出现`dm-verity curruption`时一定是硬件读写异常。
-
-而`g_boot_state = BOOT_STATE_RED`导致无法开机的设备一定是boot image或recovery image的校验出现了问题，导致校验无法通过继而无法进入系统。
+* dm-verity corruption：当机器发生该模式的错误时，一定是由于Kernel端出现了device-mapper的异常，导致了kernel restart，并且设置了相关寄存器的标志位，并且在下次重启时会写入对应slot的持久化区域中长期存在，直到检测到新的OS后将EIO的标记清除，否则，系统每次开机后均会打印`dm-verity corruption`的错误提醒，并在用户没有按下power时进行power_off操作；
+* red state: 导致该问题的原因是在LK阶段，进行boot分区的dm-verity校验时出现了异常，无论是IO异常还是内存异常均会导致该问题，而进入该异常后可以通过Fastboot模式尝试slot的有效性标记或者暂时关闭dm-verity，但是由于品网禁用了进入Fastboot模式的物理按键，因此只有通过刷机解决，该问题的产生不排除是DDR或者EMMC的问题；
+* recovery 模式：进入recovery的原因有很多种，如system_server连续多次崩溃、userdata数据异常等等，需要进一步排查。
 
 #### 参考文献
 
